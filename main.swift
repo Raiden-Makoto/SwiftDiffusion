@@ -130,11 +130,36 @@ let aggGridSize = MTLSize(width: activeEdgeCount, height: 1, depth: 1)
 aggEncoder.dispatchThreads(aggGridSize, threadsPerThreadgroup: threadgroupSize)
 aggEncoder.endEncoding()
 
+// Now we perform the coordinate update
+let coordWeightBuffer = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.size, options: .storageModeShared)!
+let coordBiasBuffer = device.makeBuffer(length: MemoryLayout<Float>.size, options: .storageModeShared)!
+let posUpdateBuffer = device.makeBuffer(length: activeNodeCount * 3 * MemoryLayout<Float>.size, options: .storageModeShared)!
+// Xavier Init the weights
+XavierInit(coordWeightBuffer, count: hiddenDim, fanIn: hiddenDim, fanOut: 1)
+memset(posUpdateBuffer.contents(), 0, posUpdateBuffer.length)
+
+let coordFunction = lib.makeFunction(name: "update_coords")!
+let coordPipeline = try device.makeComputePipelineState(function: coordFunction)
+let coordEncoder = commandBuffer.makeComputeCommandEncoder()!
+coordEncoder.setComputePipelineState(coordPipeline)
+
+coordEncoder.setBuffer(aggBuffer, offset: 0, index: 0)
+coordEncoder.setBuffer(coordWeightBuffer, offset: 0, index: 1)
+coordEncoder.setBuffer(loader.nodeBuffer, offset: 0, index: 0)
+coordEncoder.setBuffer(msgBuffer, offset: 0, index: 1)
+coordEncoder.setBuffer(loader.edgeBuffer, offset: 0, index: 2)
+coordEncoder.setBuffer(coordWeightBuffer, offset: 0, index: 3)
+coordEncoder.setBuffer(coordBiasBuffer, offset: 0, index: 4)
+coordEncoder.setBuffer(posUpdateBuffer, offset: 0, index: 5)
+coordEncoder.setBytes(&hDim, length: MemoryLayout<UInt32>.size, index: 6)
+
+coordEncoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+coordEncoder.endEncoding()
+
 // Finalize and Submit
 commandBuffer.commit()
 commandBuffer.waitUntilCompleted() // Wait for GPU to finish
-// Normally we chain multiple encoders but this is for debugging only
 
-// Check Output
-let aggPtr = aggBuffer.contents().bindMemory(to: Float.self, capacity: hiddenDim)
-print("Aggregated feature for Node 0 (Index 0): \(aggPtr[0])")
+// Check Output (V3)
+let posPtr = posUpdateBuffer.contents().bindMemory(to: Float.self, capacity: 3)
+print("Position Update for Node 0 (dx, dy, dz): (\(posPtr[0]), \(posPtr[1]), \(posPtr[2]))")

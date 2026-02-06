@@ -72,3 +72,32 @@ kernel void aggregate_message(
         );
     }
 }
+
+kernel void update_coords(
+    device const Node* nodes [[buffer(0)]], // Original positions
+    device const float* messages [[buffer(1)]], // From compute_message [E * H]
+    device const int2* edge_index [[buffer(2)]], // [E * 2]
+    device const float* coord_weights [[buffer(3)]], // [1 * H] (coord_mlp)
+    device const float* coord_bias [[buffer(4)]], // [1]
+    device atomic_float* pos_agg_out [[buffer(5)]], // [N * 3] (x, y, z updates)
+    constant uint& hidden_dim [[buffer(6)]],
+    uint gid [[thread_position_in_grid]] // Thread per Edge
+){
+    int idx = edge_index[gid].x;
+    int jdx = edge_index[gid].y;
+    float3 pos_i = nodes[idx].pos;
+    float3 pos_j = nodes[jdx].pos;
+    float3 diff = pos_i - pos_j;
+    // multi-layer perceptron
+    float weight = coord_bias[0];
+    for (uint h = 0; h < hidden_dim; h++) {
+        weight += messages[gid * hidden_dim + h] * coord_weights[h];
+    }
+    // scale the displacement
+    float3 displacement = diff * weight;
+    // Atomic Aggregation into Node Positions
+    // We update x, y, and z separately using atomic_fetch_add
+    atomic_fetch_add_explicit(&pos_agg_out[idx * 3 + 0], displacement.x, memory_order_relaxed);
+    atomic_fetch_add_explicit(&pos_agg_out[idx * 3 + 1], displacement.y, memory_order_relaxed);
+    atomic_fetch_add_explicit(&pos_agg_out[idx * 3 + 2], displacement.z, memory_order_relaxed);
+}
