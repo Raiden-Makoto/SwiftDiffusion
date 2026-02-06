@@ -101,3 +101,14 @@ kernel void update_coords(
     atomic_fetch_add_explicit(&pos_agg_out[idx * 3 + 1], displacement.y, memory_order_relaxed);
     atomic_fetch_add_explicit(&pos_agg_out[idx * 3 + 2], displacement.z, memory_order_relaxed);
 }
+
+kernel void inject_timestep(
+    device float* h                 [[buffer(0)]], // Node features [N * H]
+    constant float* t_emb           [[buffer(1)]], // Time embedding [H]
+    constant uint& hidden_dim       [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+){
+    for (uint i = 0; i < hidden_dim; i++) {
+        h[gid * hidden_dim + i] += t_emb[i]; // h = h + t_emb
+    }
+}
