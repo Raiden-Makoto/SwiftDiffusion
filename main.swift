@@ -62,8 +62,23 @@ catch {
     print("Check if the datapath exists and try again")
 }
 
-let numEdges = 26
+//  Get real counts from your loaded data
+let firstGraphMetadata = loader.graphdataBuffer!.contents().bindMemory(to: GraphData.self, capacity: 1).pointee
+let activeEdgeCount = Int(firstGraphMetadata.edgeCount)
+let activeNodeCount = Int(firstGraphMetadata.nodeCount)
 let hiddenDim = 64
+
+// Embedding Table setup
+let numAtomTypes = 10
+let embedTableSize = numAtomTypes * hiddenDim * MemoryLayout<Float>.size
+let embedTableBuffer = device.makeBuffer(length: embedTableSize, options: .storageModeShared)!
+// Xavier Init the table buffer
+XavierInit(embedTableBuffer, count: numAtomTypes * hiddenDim, fanIn: numAtomTypes, fanOut: hiddenDim)
+
+// Create the real Node features (h) buffer here (Must be done before execution)
+let hBuffer = device.makeBuffer(length: activeNodeCount * hiddenDim * MemoryLayout<Float>.size, options: .storageModeShared)!
+
+let numEdges = activeEdgeCount // don't hardcode 26
 let inputDim = 2 * hiddenDim + 1
 let weightCount = hiddenDim * inputDim
 let biasCount = hiddenDim
@@ -77,58 +92,63 @@ XavierInit(biasBuffer, count: biasCount, fanIn: hiddenDim, fanOut: 1)
 
 let msgBuffer = device.makeBuffer(length: numEdges * Int(hiddenDim) * MemoryLayout<Float>.size, options: .storageModeShared)!
 
+// Setup all pipelines upfront
 let lib = device.makeDefaultLibrary()!
-let function = lib.makeFunction(name: "compute_message")!
-let pipeline = try device.makeComputePipelineState(function: function)
 
+let embedFunction = lib.makeFunction(name: "embed_atoms")!
+let embedPipeline = try device.makeComputePipelineState(function: embedFunction)
+
+let msgFunction = lib.makeFunction(name: "compute_message")! // Renamed from 'function' to 'msgFunction' for clarity
+let msgPipeline = try device.makeComputePipelineState(function: msgFunction)
+
+let aggFunction = lib.makeFunction(name: "aggregate_message")!
+let aggPipeline = try! device.makeComputePipelineState(function: aggFunction)
+
+let coordFunction = lib.makeFunction(name: "update_coords")!
+let coordPipeline = try device.makeComputePipelineState(function: coordFunction)
+
+// --- EXECUTION START ---
 let commandBuffer = commandQueue.makeCommandBuffer()!
+
+// 1. EMBEDDING ENCODER
+let embedEncoder = commandBuffer.makeComputeCommandEncoder()!
+embedEncoder.setComputePipelineState(embedPipeline)
+
+embedEncoder.setBuffer(loader.nodeBuffer, offset: 0, index: 0)
+embedEncoder.setBuffer(embedTableBuffer, offset: 0, index: 1)
+embedEncoder.setBuffer(hBuffer, offset: 0, index: 2)
+var hDimEmbed = UInt32(hiddenDim)
+embedEncoder.setBytes(&hDimEmbed, length: MemoryLayout<UInt32>.size, index: 3)
+
+embedEncoder.dispatchThreads(
+    MTLSize(width: activeNodeCount, height: 1, depth: 1),
+    threadsPerThreadgroup: MTLSize(width: min(activeNodeCount, 32), height: 1, depth: 1)
+)
+embedEncoder.endEncoding()
+
+// 2. MESSAGE ENCODER
 let encoder = commandBuffer.makeComputeCommandEncoder()!
-encoder.setComputePipelineState(pipeline)
+encoder.setComputePipelineState(msgPipeline)
 
-//  Get real counts from your loaded data instead of placeholders
-let firstGraphMetadata = loader.graphdataBuffer!.contents().bindMemory(to: GraphData.self, capacity: 1).pointee
-let activeEdgeCount = Int(firstGraphMetadata.edgeCount)
-let activeNodeCount = Int(firstGraphMetadata.nodeCount)
-
-// Index 0: Nodes [x, y, z, type]
 encoder.setBuffer(loader.nodeBuffer, offset: 0, index: 0)
-
-// Index 1: Node Features (h) - Initially using a zeros or random buffer
-// For testing, let's create an 'h' buffer for the nodes of the first molecule
-let hBuffer = device.makeBuffer(length: activeNodeCount * hiddenDim * MemoryLayout<Float>.size, options: .storageModeShared)!
-// We don't use Xavier for activation/feature tensors, use small normal instead
-let hPtr = hBuffer.contents().bindMemory(to: Float.self, capacity: activeNodeCount * hiddenDim)
-for i in 0..<(activeNodeCount * hiddenDim) {
-  hPtr[i] = Float.random(in: -0.01...0.01)
-}
-encoder.setBuffer(hBuffer, offset: 0, index: 1)
-
-// Index 2: Edges [row, col]
+encoder.setBuffer(hBuffer, offset: 0, index: 1) // Using the filled hBuffer
 encoder.setBuffer(loader.edgeBuffer, offset: 0, index: 2)
-
-// Indices 3 & 4: Weights and Biases (already initialized by your XavierInit)
 encoder.setBuffer(weightsBuffer, offset: 0, index: 3)
 encoder.setBuffer(biasBuffer, offset: 0, index: 4)
-
-// Index 5: The output buffer for messages
 encoder.setBuffer(msgBuffer, offset: 0, index: 5)
 
-// Index 6: Pass hiddenDim as a constant
 var hDim = UInt32(hiddenDim)
 encoder.setBytes(&hDim, length: MemoryLayout<UInt32>.size, index: 6)
 
-// Dispatch: Launch one thread per edge
 let gridSize = MTLSize(width: activeEdgeCount, height: 1, depth: 1)
-let threadgroupSize = MTLSize(width: min(activeEdgeCount, pipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
+let threadgroupSize = MTLSize(width: min(activeEdgeCount, msgPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
 
 encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
-encoder.endEncoding()
+encoder.endEncoding() // MUST END BEFORE STARTING NEXT
 
-// perform aggregation
+// 3. AGGREGATION ENCODER
 let aggBuffer = device.makeBuffer(length: activeNodeCount * hiddenDim * MemoryLayout<Float>.size, options: .storageModeShared)!
 memset(aggBuffer.contents(), 0, aggBuffer.length); // ensure it starts a zero
-let aggFunction = lib.makeFunction(name: "aggregate_message")!
-let aggPipeline = try! device.makeComputePipelineState(function: aggFunction)
 
 let aggEncoder = commandBuffer.makeComputeCommandEncoder()!
 aggEncoder.setComputePipelineState(aggPipeline)
@@ -141,9 +161,9 @@ aggEncoder.setBytes(&hDimAgg, length: MemoryLayout<UInt32>.size, index: 3)
 
 let aggGridSize = MTLSize(width: activeEdgeCount, height: 1, depth: 1)
 aggEncoder.dispatchThreads(aggGridSize, threadsPerThreadgroup: threadgroupSize)
-aggEncoder.endEncoding()
+aggEncoder.endEncoding() // MUST END BEFORE STARTING NEXT
 
-// Now we perform the coordinate update
+// 4. COORDINATE UPDATE ENCODER
 let coordWeightBuffer = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.size, options: .storageModeShared)!
 let coordBiasBuffer = device.makeBuffer(length: MemoryLayout<Float>.size, options: .storageModeShared)!
 let posUpdateBuffer = device.makeBuffer(length: activeNodeCount * 3 * MemoryLayout<Float>.size, options: .storageModeShared)!
@@ -151,19 +171,15 @@ let posUpdateBuffer = device.makeBuffer(length: activeNodeCount * 3 * MemoryLayo
 XavierInit(coordWeightBuffer, count: hiddenDim, fanIn: hiddenDim, fanOut: 1)
 memset(posUpdateBuffer.contents(), 0, posUpdateBuffer.length)
 
-let coordFunction = lib.makeFunction(name: "update_coords")!
-let coordPipeline = try device.makeComputePipelineState(function: coordFunction)
 let coordEncoder = commandBuffer.makeComputeCommandEncoder()!
 coordEncoder.setComputePipelineState(coordPipeline)
 
-coordEncoder.setBuffer(aggBuffer, offset: 0, index: 0)
-coordEncoder.setBuffer(coordWeightBuffer, offset: 0, index: 1)
-coordEncoder.setBuffer(loader.nodeBuffer, offset: 0, index: 0)
-coordEncoder.setBuffer(msgBuffer, offset: 0, index: 1)
-coordEncoder.setBuffer(loader.edgeBuffer, offset: 0, index: 2)
-coordEncoder.setBuffer(coordWeightBuffer, offset: 0, index: 3)
-coordEncoder.setBuffer(coordBiasBuffer, offset: 0, index: 4)
-coordEncoder.setBuffer(posUpdateBuffer, offset: 0, index: 5)
+coordEncoder.setBuffer(loader.nodeBuffer, offset: 0, index: 0) // Pos
+coordEncoder.setBuffer(msgBuffer, offset: 0, index: 1)         // Messages
+coordEncoder.setBuffer(loader.edgeBuffer, offset: 0, index: 2) // Edge Index
+coordEncoder.setBuffer(coordWeightBuffer, offset: 0, index: 3) // Weights
+coordEncoder.setBuffer(coordBiasBuffer, offset: 0, index: 4)   // Bias
+coordEncoder.setBuffer(posUpdateBuffer, offset: 0, index: 5)   // Output
 coordEncoder.setBytes(&hDim, length: MemoryLayout<UInt32>.size, index: 6)
 
 coordEncoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
