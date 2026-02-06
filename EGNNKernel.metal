@@ -30,7 +30,11 @@ kernel void compute_message(
     float3 pos_i = nodes[idx].pos;
     float3 pos_j = nodes[jdx].pos;
     float3 diff = pos_i - pos_j;
-    float radial = dot(diff, diff) + 1e-8f;
+    float dist_sq = dot(diff, diff) + 1e-8f;
+    float dist = sqrt(dist_sq);
+    // Normalization: This ensures the MLP input doesn't explode
+    float radial = 1.0f / (1.0f + dist);
+    
     // Linear Layer 1
     uint input_dim = 2 * hidden_dim + 1;
     for (uint row = 0; row < hidden_dim; row++){
