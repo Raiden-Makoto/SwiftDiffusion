@@ -41,7 +41,7 @@ let loader = QM9Loader(device: device)
 let datapath = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
 try! loader.load(from: datapath)
 
-// --- DATASET SIZING & BOUNDS-SAFE SPLIT ---
+// --- DATASET SIZING & PHYSICAL ALIGNMENT ---
 
 let nodeStride = MemoryLayout<Node>.stride
 let edgeStride = MemoryLayout<SIMD2<Int32>>.stride
@@ -138,7 +138,14 @@ blit.endEncoding(); setupCB.commit(); setupCB.waitUntilCompleted()
 [gradW, gradNodeW, gradNodeB, gradCoordW, gradCoordB, gradH, gradPos, gradMsg, gradMsgInputT, weightsM, weightsV, nodeWM, nodeWV, coordWM, coordWV, coordBM, coordBV, biasM, biasV, normSq, lossT, lossV, hT, hV, posT, posV, aggT, aggV, msgT, msgV].forEach { ZeroInit($0) }
 KaimingInit(weights, count: hiddenDim * (2 * hiddenDim + 1), fanIn: (2 * hiddenDim + 1))
 KaimingInit(nodeW, count: hiddenDim * 2 * hiddenDim, fanIn: 2 * hiddenDim)
-ZeroInit(coordW); ZeroInit(bias); ZeroInit(coordB)
+
+// FIX: Enable flow without explosion by using a small random scale for coordinate weights
+let cPtr = coordW.contents().bindMemory(to: Float.self, capacity: hiddenDim)
+for i in 0..<hiddenDim { cPtr[i] = Float.random(in: -0.01...0.01) }
+let cbPtr = coordB.contents().bindMemory(to: Float.self, capacity: 1)
+cbPtr[0] = Float.random(in: -0.01...0.01)
+ZeroInit(bias)
+
 KaimingInit(embedTable, count: 10 * hiddenDim, fanIn: 10)
 
 let nPtrT = noiseT.contents().bindMemory(to: Float.self, capacity: trainNodes * 3)
@@ -154,7 +161,7 @@ for n in names { p[n] = try! device.makeComputePipelineState(function: lib.makeF
 // --- TRAINING LOOP ---
 
 var timestep: UInt32 = 1
-var lr: Float = 1e-5 // REDUCED STARTING LR FOR STABILITY
+var lr: Float = 1e-5 // BALANCED LR FOR STABILITY
 
 for epoch in 1...50 {
     let cb = commandQueue.makeCommandBuffer()!
@@ -190,72 +197,81 @@ for epoch in 1...50 {
     enc.setComputePipelineState(p["compute_mse_loss"]!); enc.setBuffer(posT, offset: 0, index: 0); enc.setBuffer(noiseT, offset: 0, index: 1); enc.setBuffer(lossT, offset: 0, index: 2); var trN = UInt32(trainNodes*3); enc.setBytes(&trN, length: 4, index: 3)
     enc.dispatchThreads(MTLSize(width: Int(trN), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
 
-    // --- BACKPROP CHAIN ---
+    // --- START BACKPROP CHAIN ---
     
+    // 1. Starting Gradient: dL/dpos
     enc.setComputePipelineState(p["compute_mse_gradient"]!); enc.setBuffer(posT, offset: 0, index: 0); enc.setBuffer(noiseT, offset: 0, index: 1); enc.setBuffer(gradPos, offset: 0, index: 2); enc.setBytes(&trN, length: 4, index: 3)
     enc.dispatchThreads(MTLSize(width: Int(trN), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     
+    // 2. Coordinate Backprop: dL/dpos -> dL/dmsg, gradCoordW
     enc.setComputePipelineState(p["backward_coordinate"]!); enc.setBuffer(gradPos, offset: 0, index: 0); enc.setBuffer(coordW, offset: 0, index: 1); enc.setBuffer(msgT, offset: 0, index: 2); enc.setBuffer(edgeBufT, offset: 0, index: 3); enc.setBuffer(posT, offset: 0, index: 4); enc.setBuffer(gradCoordW, offset: 0, index: 5); enc.setBuffer(gradMsg, offset: 0, index: 6); enc.setBytes(&hDim, length: 4, index: 7)
     enc.dispatchThreads(MTLSize(width: trainEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     
-    enc.setComputePipelineState(p["backward_message"]!); enc.setBuffer(gradMsg, offset: 0, index: 0); enc.setBuffer(weights, offset: 0, index: 1); enc.setBuffer(msgInputT, offset: 0, index: 2); enc.setBuffer(preActivT, offset: 0, index: 3); enc.setBuffer(gradW, offset: 0, index: 4); enc.setBuffer(gradMsgInputT, offset: 0, index: 5); enc.setBytes(&hDim, length: 4, index: 6); var trainEdgeCount = UInt32(trainEdges); enc.setBytes(&trainEdgeCount, length: 4, index: 7)
+    // 3. Message Backprop: dL/dmsg -> dL/d(MessageInputs), gradW
+    enc.setComputePipelineState(p["backward_message"]!); enc.setBuffer(gradMsg, offset: 0, index: 0); enc.setBuffer(weights, offset: 0, index: 1); enc.setBuffer(msgInputT, offset: 0, index: 2); enc.setBuffer(preActivT, offset: 0, index: 3); enc.setBuffer(gradW, offset: 0, index: 4); enc.setBuffer(gradMsgInputT, offset: 0, index: 5); enc.setBytes(&hDim, length: 4, index: 6); var currentTrainEdges = UInt32(trainEdges); enc.setBytes(&currentTrainEdges, length: 4, index: 7)
     enc.dispatchThreads(MTLSize(width: trainEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
 
-    enc.setComputePipelineState(p["accumulate_node_gradients"]!); enc.setBuffer(gradMsgInputT, offset: 0, index: 0); enc.setBuffer(edgeBufT, offset: 0, index: 1); enc.setBuffer(gradH, offset: 0, index: 2); enc.setBytes(&hDim, length: 4, index: 3); enc.setBytes(&trainEdgeCount, length: 4, index: 4)
+    // 4. Map gradients back to nodes
+    enc.setComputePipelineState(p["accumulate_node_gradients"]!); enc.setBuffer(gradMsgInputT, offset: 0, index: 0); enc.setBuffer(edgeBufT, offset: 0, index: 1); enc.setBuffer(gradH, offset: 0, index: 2); enc.setBytes(&hDim, length: 4, index: 3); enc.setBytes(&currentTrainEdges, length: 4, index: 4)
     enc.dispatchThreads(MTLSize(width: trainEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
 
+    // 5. Node Backprop: hidden state grad -> node weight grad
     enc.setComputePipelineState(p["backward_node"]!); enc.setBuffer(gradH, offset: 0, index: 0); enc.setBuffer(nodeW, offset: 0, index: 1); enc.setBuffer(nodeActivT, offset: 0, index: 2); enc.setBuffer(preActivNodeT, offset: 0, index: 3); enc.setBuffer(gradNodeW, offset: 0, index: 4); enc.setBuffer(gradNodeB, offset: 0, index: 5); enc.setBuffer(gradH, offset: 0, index: 6); enc.setBytes(&hDim, length: 4, index: 7)
     enc.dispatchThreads(MTLSize(width: trainNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
 
-    // INSERT: Universal Gradient Clipping for all weights to stop inf/nan
-    let gradBuffers = [gradW, gradNodeW, gradCoordW, gradNodeB, gradCoordB]
-    var maxNorm: Float = 0.1
-    for gb in gradBuffers {
-        var gradCount = UInt32(gb.length / 4)
-        enc.setComputePipelineState(p["compute_grad_norm_sq"]!); enc.setBuffer(gb, offset: 0, index: 0); enc.setBuffer(normSq, offset: 0, index: 1); enc.setBytes(&gradCount, length: 4, index: 2)
-        enc.dispatchThreads(MTLSize(width: Int(gradCount), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-        
-        enc.setComputePipelineState(p["apply_clipping"]!); enc.setBuffer(gb, offset: 0, index: 0); enc.setBuffer(normSq, offset: 0, index: 1); enc.setBytes(&maxNorm, length: 4, index: 2); enc.setBytes(&gradCount, length: 4, index: 3)
-        enc.dispatchThreads(MTLSize(width: Int(gradCount), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    // INSERT: Stability Fix - Explicitly reset norm and clip per-buffer to stop nan
+    enc.endEncoding()
+    let gList = [gradW, gradNodeW, gradCoordW, gradNodeB, gradCoordB]
+    var maxN: Float = 0.1
+    for gb in gList {
+        let bR = cb.makeBlitCommandEncoder()!; bR.fill(buffer: normSq, range: 0..<4, value: 0); bR.endEncoding()
+        let cE = cb.makeComputeCommandEncoder()!
+        var gC = UInt32(gb.length / 4)
+        cE.setComputePipelineState(p["compute_grad_norm_sq"]!); cE.setBuffer(gb, offset: 0, index: 0); cE.setBuffer(normSq, offset: 0, index: 1); cE.setBytes(&gC, length: 4, index: 2)
+        cE.dispatchThreads(MTLSize(width: Int(gC), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        cE.setComputePipelineState(p["apply_clipping"]!); cE.setBuffer(gb, offset: 0, index: 0); cE.setBuffer(normSq, offset: 0, index: 1); cE.setBytes(&maxN, length: 4, index: 2); cE.setBytes(&gC, length: 4, index: 3)
+        cE.dispatchThreads(MTLSize(width: Int(gC), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        cE.endEncoding()
     }
-
+    
+    let aEnc = cb.makeComputeCommandEncoder()!
     // ADAM UPDATES
     var gradCount = UInt32(weights.length / 4)
-    enc.setComputePipelineState(p["apply_adam_update"]!); enc.setBuffer(weights, offset: 0, index: 0); enc.setBuffer(weightsM, offset: 0, index: 1); enc.setBuffer(weightsV, offset: 0, index: 2); enc.setBuffer(gradW, offset: 0, index: 3); enc.setBytes(&lr, length: 4, index: 4)
-    var b1: Float = 0.9; var b2: Float = 0.999; var eps: Float = 1e-8; var t = timestep; enc.setBytes(&b1, length: 4, index: 5); enc.setBytes(&b2, length: 4, index: 6); enc.setBytes(&eps, length: 4, index: 7); enc.setBytes(&t, length: 4, index: 8)
-    enc.dispatchThreads(MTLSize(width: Int(gradCount), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    aEnc.setComputePipelineState(p["apply_adam_update"]!); aEnc.setBuffer(weights, offset: 0, index: 0); aEnc.setBuffer(weightsM, offset: 0, index: 1); aEnc.setBuffer(weightsV, offset: 0, index: 2); aEnc.setBuffer(gradW, offset: 0, index: 3); aEnc.setBytes(&lr, length: 4, index: 4)
+    var b1: Float = 0.9; var b2: Float = 0.999; var eps: Float = 1e-8; var t = timestep; aEnc.setBytes(&b1, length: 4, index: 5); aEnc.setBytes(&b2, length: 4, index: 6); aEnc.setBytes(&eps, length: 4, index: 7); aEnc.setBytes(&t, length: 4, index: 8)
+    aEnc.dispatchThreads(MTLSize(width: Int(gradCount), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     
-    enc.setBuffer(nodeW, offset: 0, index: 0); enc.setBuffer(nodeWM, offset: 0, index: 1); enc.setBuffer(nodeWV, offset: 0, index: 2); enc.setBuffer(gradNodeW, offset: 0, index: 3); var nWCount = UInt32(nodeW.length / 4)
-    enc.dispatchThreads(MTLSize(width: Int(nWCount), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    aEnc.setBuffer(nodeW, offset: 0, index: 0); aEnc.setBuffer(nodeWM, offset: 0, index: 1); aEnc.setBuffer(nodeWV, offset: 0, index: 2); aEnc.setBuffer(gradNodeW, offset: 0, index: 3); var nWCount = UInt32(nodeW.length / 4)
+    aEnc.dispatchThreads(MTLSize(width: Int(nWCount), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     
-    enc.setBuffer(coordW, offset: 0, index: 0); enc.setBuffer(coordWM, offset: 0, index: 1); enc.setBuffer(coordWV, offset: 0, index: 2); enc.setBuffer(gradCoordW, offset: 0, index: 3); var cWCount = UInt32(coordW.length / 4)
-    enc.dispatchThreads(MTLSize(width: Int(cWCount), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    aEnc.setBuffer(coordW, offset: 0, index: 0); aEnc.setBuffer(coordWM, offset: 0, index: 1); aEnc.setBuffer(coordWV, offset: 0, index: 2); aEnc.setBuffer(gradCoordW, offset: 0, index: 3); var cWCount = UInt32(coordW.length / 4)
+    aEnc.dispatchThreads(MTLSize(width: Int(cWCount), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
 
-    enc.setBuffer(bias, offset: 0, index: 0); enc.setBuffer(biasM, offset: 0, index: 1); enc.setBuffer(biasV, offset: 0, index: 2); enc.setBuffer(gradNodeB, offset: 0, index: 3); var bWCount = UInt32(bias.length / 4)
-    enc.dispatchThreads(MTLSize(width: Int(bWCount), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    aEnc.setBuffer(bias, offset: 0, index: 0); aEnc.setBuffer(biasM, offset: 0, index: 1); aEnc.setBuffer(biasV, offset: 0, index: 2); aEnc.setBuffer(gradNodeB, offset: 0, index: 3); var bWCount = UInt32(bias.length / 4)
+    aEnc.dispatchThreads(MTLSize(width: Int(bWCount), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     
-    enc.setBuffer(coordB, offset: 0, index: 0); enc.setBuffer(coordBM, offset: 0, index: 1); enc.setBuffer(coordBV, offset: 0, index: 2); enc.setBuffer(gradCoordB, offset: 0, index: 3)
-    enc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+    aEnc.setBuffer(coordB, offset: 0, index: 0); aEnc.setBuffer(coordBM, offset: 0, index: 1); aEnc.setBuffer(coordBV, offset: 0, index: 2); aEnc.setBuffer(gradCoordB, offset: 0, index: 3)
+    aEnc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
 
     // 2. VALIDATION PHASE
-    enc.setComputePipelineState(p["embed_atoms"]!); enc.setBuffer(nodeBufV, offset: 0, index: 0); enc.setBuffer(embedTable, offset: 0, index: 1); enc.setBuffer(hV, offset: 0, index: 2); enc.setBytes(&hDim, length: 4, index: 3); var valNodeCount = UInt32(valNodes); enc.setBytes(&valNodeCount, length: 4, index: 4); enc.setBytes(&numTypes, length: 4, index: 5)
-    enc.dispatchThreads(MTLSize(width: valNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    aEnc.setComputePipelineState(p["embed_atoms"]!); aEnc.setBuffer(nodeBufV, offset: 0, index: 0); aEnc.setBuffer(embedTable, offset: 0, index: 1); aEnc.setBuffer(hV, offset: 0, index: 2); aEnc.setBytes(&hDim, length: 4, index: 3); var valNodeCount = UInt32(valNodes); aEnc.setBytes(&valNodeCount, length: 4, index: 4); aEnc.setBytes(&numTypes, length: 4, index: 5)
+    aEnc.dispatchThreads(MTLSize(width: valNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     
     for _ in 0..<4 {
-        enc.setComputePipelineState(p["compute_message"]!); enc.setBuffer(nodeBufV, offset: 0, index: 0); enc.setBuffer(hV, offset: 0, index: 1); enc.setBuffer(edgeBufV, offset: 0, index: 2); enc.setBuffer(weights, offset: 0, index: 3); enc.setBuffer(bias, offset: 0, index: 4); enc.setBuffer(msgV, offset: 0, index: 5); enc.setBytes(&hDim, length: 4, index: 6); enc.setBuffer(msgInputV, offset: 0, index: 7); enc.setBuffer(preActivV, offset: 0, index: 8)
-        enc.dispatchThreads(MTLSize(width: valEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-        enc.setComputePipelineState(p["aggregate_message"]!); enc.setBuffer(msgV, offset: 0, index: 0); enc.setBuffer(edgeBufV, offset: 0, index: 1); enc.setBuffer(aggV, offset: 0, index: 2); enc.setBytes(&hDim, length: 4, index: 3)
-        enc.dispatchThreads(MTLSize(width: valEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-        enc.setComputePipelineState(p["update_coords"]!); enc.setBuffer(nodeBufV, offset: 0, index: 0); enc.setBuffer(msgV, offset: 0, index: 1); enc.setBuffer(edgeBufV, offset: 0, index: 2); enc.setBuffer(coordW, offset: 0, index: 3); enc.setBuffer(coordB, offset: 0, index: 4); enc.setBuffer(posV, offset: 0, index: 5); enc.setBytes(&hDim, length: 4, index: 6)
-        enc.dispatchThreads(MTLSize(width: valEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-        enc.setComputePipelineState(p["apply_updates"]!); enc.setBuffer(nodeBufV, offset: 0, index: 0); enc.setBuffer(hV, offset: 0, index: 1); enc.setBuffer(posV, offset: 0, index: 2); enc.setBuffer(aggV, offset: 0, index: 3); enc.setBuffer(nodeW, offset: 0, index: 4); enc.setBuffer(bias, offset: 0, index: 5); enc.setBytes(&hDim, length: 4, index: 6); enc.setBuffer(nodeActivV, offset: 0, index: 7); enc.setBuffer(preActivNodeV, offset: 0, index: 8)
-        enc.dispatchThreads(MTLSize(width: valNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        aEnc.setComputePipelineState(p["compute_message"]!); aEnc.setBuffer(nodeBufV, offset: 0, index: 0); aEnc.setBuffer(hV, offset: 0, index: 1); aEnc.setBuffer(edgeBufV, offset: 0, index: 2); aEnc.setBuffer(weights, offset: 0, index: 3); aEnc.setBuffer(bias, offset: 0, index: 4); aEnc.setBuffer(msgV, offset: 0, index: 5); aEnc.setBytes(&hDim, length: 4, index: 6); aEnc.setBuffer(msgInputV, offset: 0, index: 7); aEnc.setBuffer(preActivV, offset: 0, index: 8)
+        aEnc.dispatchThreads(MTLSize(width: valEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        aEnc.setComputePipelineState(p["aggregate_message"]!); aEnc.setBuffer(msgV, offset: 0, index: 0); aEnc.setBuffer(edgeBufV, offset: 0, index: 1); aEnc.setBuffer(aggV, offset: 0, index: 2); aEnc.setBytes(&hDim, length: 4, index: 3)
+        aEnc.dispatchThreads(MTLSize(width: valEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        aEnc.setComputePipelineState(p["update_coords"]!); aEnc.setBuffer(nodeBufV, offset: 0, index: 0); aEnc.setBuffer(msgV, offset: 0, index: 1); aEnc.setBuffer(edgeBufV, offset: 0, index: 2); aEnc.setBuffer(coordW, offset: 0, index: 3); aEnc.setBuffer(coordB, offset: 0, index: 4); aEnc.setBuffer(posV, offset: 0, index: 5); aEnc.setBytes(&hDim, length: 4, index: 6)
+        aEnc.dispatchThreads(MTLSize(width: valEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        aEnc.setComputePipelineState(p["apply_updates"]!); aEnc.setBuffer(nodeBufV, offset: 0, index: 0); aEnc.setBuffer(hV, offset: 0, index: 1); aEnc.setBuffer(posV, offset: 0, index: 2); aEnc.setBuffer(aggV, offset: 0, index: 3); aEnc.setBuffer(nodeW, offset: 0, index: 4); aEnc.setBuffer(bias, offset: 0, index: 5); aEnc.setBytes(&hDim, length: 4, index: 6); aEnc.setBuffer(nodeActivV, offset: 0, index: 7); aEnc.setBuffer(preActivNodeV, offset: 0, index: 8)
+        aEnc.dispatchThreads(MTLSize(width: valNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     }
 
-    enc.setComputePipelineState(p["compute_mse_loss"]!); enc.setBuffer(posV, offset: 0, index: 0); enc.setBuffer(noiseV, offset: 0, index: 1); enc.setBuffer(lossV, offset: 0, index: 2); var vN = UInt32(valNodes*3); enc.setBytes(&vN, length: 4, index: 3)
-    enc.dispatchThreads(MTLSize(width: Int(vN), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    aEnc.setComputePipelineState(p["compute_mse_loss"]!); aEnc.setBuffer(posV, offset: 0, index: 0); aEnc.setBuffer(noiseV, offset: 0, index: 1); aEnc.setBuffer(lossV, offset: 0, index: 2); var vN = UInt32(valNodes*3); aEnc.setBytes(&vN, length: 4, index: 3)
+    aEnc.dispatchThreads(MTLSize(width: Int(vN), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
 
-    enc.endEncoding()
+    aEnc.endEncoding()
     cb.addCompletedHandler { _ in
         let tMse = lossT.contents().bindMemory(to: Float.self, capacity: 1).pointee / Float(trainNodes*3)
         let vMse = lossV.contents().bindMemory(to: Float.self, capacity: 1).pointee / Float(valNodes*3)
