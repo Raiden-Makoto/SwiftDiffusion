@@ -92,3 +92,60 @@ for i in 0..<numLayers {
 
 print("Chunk Verification: Loaded \(weights.count) total weight buffers.")
 print(sectionBreak)
+
+// --- DATA PREPARATION ---
+let numNodes = 5 // for Methane only
+let atomTypes: [Int32] = [6, 1, 1, 1, 1] // Example: Methane (C, H, H, H, H)
+
+let typeBuf = device.makeBuffer(bytes: atomTypes, length: numNodes * MemoryLayout<Int32>.size, options: .storageModeShared)!
+let hBuf = device.makeBuffer(length: numNodes * hiddenDim * 4, options: .storageModeShared)!
+let tProcessedBuf = device.makeBuffer(length: hiddenDim * 4, options: .storageModeShared)! // Final t_emb after MLP
+
+// --- DISPATCH ---
+guard let library = device.makeDefaultLibrary() else { fatalError("Couldn't load default compute library.") }
+var pipeline: [String: MTLComputePipelineState] = [:]
+
+do {
+    // Pipeline for atom embedding lookup
+    let embedFunction = library.makeFunction(name: "embed_atoms")!
+    pipeline["embed_atoms"] = try device.makeComputePipelineState(function: embedFunction)
+    
+    // Pipeline for timestep injection conditioning
+    let injectFunction = library.makeFunction(name: "inject_timestamp")!
+    pipeline["inject_timestep"] = try device.makeComputePipelineState(function: injectFunction)
+    
+    print("Metal Pipelines initialized for: \(pipeline.keys.joined(separator: ", "))")
+} catch {
+    fatalError("Failed to create compute pipeline states: \(error)")
+}
+
+let commandQueue = device.makeCommandQueue()!
+let cb = commandQueue.makeCommandBuffer()!
+let enc = cb.makeComputeCommandEncoder()!
+
+var hDim = UInt32(hiddenDim)
+var nNodes = UInt32(numNodes)
+
+// A. Embed raw atom types
+enc.setComputePipelineState(pipeline["embed_atoms"]!)
+enc.setBuffer(typeBuf, offset: 0, index: 0)
+enc.setBuffer(weights["embedding.weight"], offset: 0, index: 1)
+enc.setBuffer(hBuf, offset: 0, index: 2)
+enc.setBytes(&hDim, length: 4, index: 3)
+enc.setBytes(&nNodes, length: 4, index: 4)
+enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+
+// B. Inject Timestep into Hidden States
+enc.setComputePipelineState(pipeline["inject_timestep"]!)
+enc.setBuffer(hBuf, offset: 0, index: 0)
+enc.setBuffer(tProcessedBuf, offset: 0, index: 1)
+enc.setBytes(&hDim, length: 4, index: 2)
+enc.setBytes(&nNodes, length: 4, index: 3)
+enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+
+enc.endEncoding()
+cb.commit()
+cb.waitUntilCompleted()
+
+print("Features embedded and conditioned on timestep.")
+print(sectionBreak)
