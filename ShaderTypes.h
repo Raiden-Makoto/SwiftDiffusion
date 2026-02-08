@@ -17,3 +17,7 @@ struct GraphData {
     uint nodeCount;
     uint edgeCount;
 };
+
+static inline float silu(float x){
+    return x / (1.0f + exp(-x));
+}

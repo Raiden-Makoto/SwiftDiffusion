@@ -8,9 +8,7 @@
 #include <metal_stdlib>
 #include "ShaderTypes.h"
 
-inline float silu(float x){
-    return x / (1.0f + exp(-x));
-}
+using namespace metal;
 
 // generic linear layer
 kernel void linear_layer(

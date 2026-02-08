@@ -8,6 +8,8 @@
 #include "ShaderTypes.h"
 #include <metal_stdlib>
 
+using namespace metal;
+
 kernel void embed_atoms(
                         device const int * atom_types [[buffer(0)]],
                         device const float* embed_table [[buffer(1)]],
