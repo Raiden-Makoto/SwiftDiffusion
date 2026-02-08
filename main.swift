@@ -42,9 +42,9 @@ func loadAndVerify(_ name: String, rows: Int, cols: Int, path: String) {
         if data.count == expectedBytes {
             buffer.contents().copyMemory(from: (data as NSData).bytes, byteCount: data.count)
             weights[name] = buffer
-            print("VERIFIED: \(name).bin (\(data.count) bytes)")
+            //print("VERIFIED: \(name).bin (\(data.count) bytes)")
         } else if data.count < expectedBytes {
-            print("PARTIAL LOAD: \(data.count)/\(expectedBytes) loaded. Padding with zeros")
+            //print("PARTIAL LOAD: \(data.count)/\(expectedBytes) loaded. Padding with zeros")
         } else {
             print("SIZE MISMATCH: \(name) - File: \(data.count), Buffer Needs: \(expectedBytes)")
         }
@@ -70,7 +70,6 @@ loadAndVerify("timestep_mlp.2.bias",   rows: 1,         cols: hiddenDim, path: d
 
 // 4. Recursive Layers (0-3)
 for i in 0..<numLayers {
-    print("Layer \(i):")
     // Message MLP
     loadAndVerify("layers.\(i).message_mlp.0.weight", rows: hiddenDim, cols: 2 * hiddenDim + 1, path: datapath)
     loadAndVerify("layers.\(i).message_mlp.0.bias",   rows: 1,         cols: hiddenDim, path: datapath)
@@ -99,6 +98,21 @@ let atomTypes: [Int32] = [6, 1, 1, 1, 1] // Example: Methane (C, H, H, H, H)
 
 let typeBuf = device.makeBuffer(bytes: atomTypes, length: numNodes * MemoryLayout<Int32>.size, options: .storageModeShared)!
 let hBuf = device.makeBuffer(length: numNodes * hiddenDim * 4, options: .storageModeShared)!
+
+let currentStep: Float = 501.0 // Example timestep index
+var sinData = [Float](repeating: 0, count: hiddenDim)
+let halfDim = hiddenDim / 2
+let exponentBase = log(10000.0) / Float(halfDim - 1)
+
+for i in 0..<halfDim {
+    let freq = exp(Float(i) * -exponentBase)
+    let arg = currentStep * freq
+    sinData[i] = sin(arg)
+    sinData[i + halfDim] = cos(arg)
+}
+
+// Create the buffer from the CPU data
+let tSinBuf = device.makeBuffer(bytes: sinData, length: hiddenDim * 4, options: .storageModeShared)!
 let tProcessedBuf = device.makeBuffer(length: hiddenDim * 4, options: .storageModeShared)! // Final t_emb after MLP
 
 // --- DISPATCH ---
@@ -143,9 +157,47 @@ enc.setBytes(&hDim, length: 4, index: 2)
 enc.setBytes(&nNodes, length: 4, index: 3)
 enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
 
+print("Features embedded and conditioned on timestep.")
+print(sectionBreak)
+
+do {
+    let linearFunc = library.makeFunction(name: "linear_layer")!
+    pipeline["linear_layer"] = try device.makeComputePipelineState(function: linearFunc)
+} catch {
+    fatalError("Failed to create compute pipeline states: \(error)")
+}
+
+var applySiLU: Bool = true
+
+print("Timstep MLP Activated")
+// Linear (128, 128) + SiLU
+enc.setComputePipelineState(pipeline["linear_layer"]!)
+enc.setBuffer(tSinBuf, offset: 0, index: 0) // Raw Sinusoidal input
+enc.setBuffer(weights["timestep_mlp.0.weight"], offset: 0, index: 1)
+enc.setBuffer(weights["timestep_mlp.0.bias"], offset: 0, index: 2)
+enc.setBuffer(tProcessedBuf, offset: 0, index: 3)
+enc.setBytes(&hDim, length: 4, index: 4) // inDim
+enc.setBytes(&hDim, length: 4, index: 5) // outDim
+enc.setBytes(&applySiLU, length: 1, index: 6)
+enc.dispatchThreads(
+    MTLSize(width: hiddenDim, height: 1, depth: 1),
+    threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+)
+// Linear (128, 128) - No Activation
+applySiLU = !applySiLU
+enc.setBuffer(tProcessedBuf, offset: 0, index: 0)
+enc.setBuffer(weights["timestep_mlp.2.weight"], offset: 0, index: 1)
+enc.setBuffer(weights["timestep_mlp.2.bias"], offset: 0, index: 2)
+enc.setBuffer(tProcessedBuf, offset: 0, index: 3) // Overwrite with final result
+enc.setBytes(&applySiLU, length: 1, index: 6) // apply_silu = false
+enc.dispatchThreads(
+    MTLSize(width: hiddenDim, height: 1, depth: 1),
+    threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+)
+
 enc.endEncoding()
 cb.commit()
 cb.waitUntilCompleted()
 
-print("Features embedded and conditioned on timestep.")
+print("Timstep MLP Complete")
 print(sectionBreak)
