@@ -49,9 +49,9 @@ func loadAndVerify(_ name: String, rows: Int, cols: Int, path: String) {
         if data.count == expectedBytes {
             buffer.contents().copyMemory(from: (data as NSData).bytes, byteCount: data.count)
             weights[name] = buffer
-            //print("VERIFIED: \(name).bin (\(data.count) bytes)")
+            print("VERIFIED: \(name).bin (\(data.count) bytes)")
         } else if data.count < expectedBytes {
-            //print("PARTIAL LOAD: \(data.count)/\(expectedBytes) loaded. Padding with zeros")
+            print("PARTIAL LOAD: \(name).bin \(data.count)/\(expectedBytes) loaded. Padding with zeros")
             weights[name] = buffer
         } else {
             print("SIZE MISMATCH: \(name) - File: \(data.count), Buffer Needs: \(expectedBytes)")
@@ -109,6 +109,7 @@ let atomTypesCH4: [Int32] = [6, 1, 1, 1, 1]
 let nodeBuf = device.makeBuffer(length: numNodes * MemoryLayout<Node>.stride, options: .storageModeShared)!
 let typeBuf = device.makeBuffer(length: numNodes * 4, options: .storageModeShared)!
 let edgeBuf = device.makeBuffer(length: numEdges * MemoryLayout<SIMD2<Int32>>.stride, options: .storageModeShared)!
+let coordTempBuf = device.makeBuffer(length: numEdges * hiddenDim * 4, options: .storageModeShared)!
 
 // WORKSPACE BUFFERS
 // 1. Features & Messages
@@ -271,21 +272,23 @@ for t in (1...500).reversed() {
         enc.dispatchThreads(MTLSize(width: numEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
 
         // B. COORDINATE MLP
-        enc.memoryBarrier(scope: .buffers)
+        enc.memoryBarrier(scope: .buffers) // Keep the barrier
         enc.setComputePipelineState(pipeline["linear_128x128"]!)
-        enc.setBuffer(msgBuf, offset: 0, index: 0) // MsgBuf -> Stage 1
+        enc.setBuffer(msgBuf, offset: 0, index: 0)
         enc.setBuffer(weights["layers.\(i).coord_mlp.0.weight"]!, offset: 0, index: 1)
         enc.setBuffer(weights["layers.\(i).coord_mlp.0.bias"]!, offset: 0, index: 2)
-        enc.setBuffer(tempH, offset: 0, index: 3) // Stage 1 -> Temp
-        enc.setBytes(&nEdgesU, length: 4, index: 4); enc.setBytes(&doSiLU, length: 4, index: 5)
+        enc.setBuffer(coordTempBuf, offset: 0, index: 3) // USE NEW coordTempBuf HERE
+        enc.setBytes(&nEdgesU, length: 4, index: 4)
+        enc.setBytes(&doSiLU, length: 4, index: 5)
         enc.dispatchThreads(MTLSize(width: numEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-        
+
         enc.setComputePipelineState(pipeline["linear_128x1"]!)
-        enc.setBuffer(tempH, offset: 0, index: 0) // Temp -> Stage 2
+        enc.setBuffer(coordTempBuf, offset: 0, index: 0) // READ FROM NEW coordTempBuf
         enc.setBuffer(weights["layers.\(i).coord_mlp.2.weight"]!, offset: 0, index: 1)
         enc.setBuffer(weights["layers.\(i).coord_mlp.2.bias"]!, offset: 0, index: 2)
-        enc.setBuffer(coordScalarBuf, offset: 0, index: 3) // Stage 2 -> Scalar
-        enc.setBytes(&nEdgesU, length: 4, index: 4); enc.setBytes(&skipSiLU, length: 4, index: 5)
+        enc.setBuffer(coordScalarBuf, offset: 0, index: 3)
+        enc.setBytes(&nEdgesU, length: 4, index: 4)
+        enc.setBytes(&skipSiLU, length: 4, index: 5)
         enc.dispatchThreads(MTLSize(width: numEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
 
         enc.setComputePipelineState(pipeline["compute_displacement"]!)
