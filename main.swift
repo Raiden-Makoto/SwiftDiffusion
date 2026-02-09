@@ -291,6 +291,15 @@ for name in layerKernels{
     pipeline[name] = try! device.makeComputePipelineState(function: library.makeFunction(name: name)!)
 }
 
+let geometryKernels = [
+    "cog_normalization",
+    "compute_cog"
+]
+
+for name in geometryKernels{
+    pipeline[name] = try! device.makeComputePipelineState(function: library.makeFunction(name: name)!)
+}
+
 for i in 0..<3 {
     print("\tCurrently in Layer \(i)...")
     // 1. MESSAGE MLP
@@ -412,3 +421,61 @@ cb.waitUntilCompleted()
 print("Three Layer EGNNLayer Stack Complete")
 print(sectionBreak)
 
+// Apply Center of Gravity Normalization
+let cogBuf = device.makeBuffer(length: 3 * MemoryLayout<Float>.stride, options: .storageModeShared)!
+let cogCB = commandQueue.makeCommandBuffer()!
+
+// Reset the CoG sum buffer to zero
+let cogBlit = cogCB.makeBlitCommandEncoder()!
+cogBlit.fill(buffer: cogBuf, range: 0..<cogBuf.length, value: 0)
+cogBlit.endEncoding()
+
+let cogEnc = cogCB.makeComputeCommandEncoder()!
+
+// Compute the sum of all positions
+cogEnc.setComputePipelineState(pipeline["compute_cog"]!)
+cogEnc.setBuffer(nodeBuf, offset: 0, index: 0)
+cogEnc.setBuffer(cogBuf, offset: 0, index: 1)
+cogEnc.setBytes(&nNodes, length: 4, index: 2)
+cogEnc.dispatchThreads(
+    MTLSize(width: numNodes, height: 1, depth: 1),
+    threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+)
+
+// Subtract the centroid from every node
+cogEnc.setComputePipelineState(pipeline["cog_normalization"]!)
+cogEnc.setBuffer(nodeBuf, offset: 0, index: 0)
+cogEnc.setBuffer(cogBuf, offset: 0, index: 1)
+cogEnc.setBytes(&nNodes, length: 4, index: 2)
+cogEnc.dispatchThreads(
+    MTLSize(width: numNodes, height: 1, depth: 1),
+    threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+)
+
+cogEnc.endEncoding()
+cogCB.commit()
+cogCB.waitUntilCompleted()
+
+print("Molecule centered at origin.")
+print(sectionBreak)
+print("Final Molecular Coordinates (Angstroms)")
+
+// Access the raw pointer from the GPU buffer
+let pointer = nodeBuf.contents().bindMemory(to: Node.self, capacity: numNodes)
+
+// Iterate and print each node's position
+for i in 0..<numNodes {
+    let node = pointer[i]
+    let p = node.pos
+    let type = Int(node.atomType)
+    // Format for easy reading: "Atom [Type]: (x, y, z)"
+    let name = (type == 6) ? "Carbon" : "Hydrogen"
+    print(String(format: "Node %d [%@]: (%7.4f, %7.4f, %7.4f)", i, name, p.x, p.y, p.z))
+}
+
+// Sanity Check: Center of Gravity calculation on CPU
+var sum = SIMD3<Float>(0, 0, 0)
+for i in 0..<numNodes { sum += pointer[i].pos }
+let avg = sum / Float(numNodes)
+print(String(format: "\nCalculated Centroid: (%7.4f, %7.4f, %7.4f)", avg.x, avg.y, avg.z))
+print(sectionBreak)
