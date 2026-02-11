@@ -387,23 +387,6 @@ for t in (1...500).reversed() {
     enc.endEncoding()
     stepCB.commit()
     stepCB.waitUntilCompleted()
-    
-    if (t % 50 == 0) {
-        // Sync the GPU buffer to a CPU pointer
-        let ptr = nodeBuf.contents().bindMemory(to: Node.self, capacity: numNodes)
-        
-        // Use the explicit SIMD length function
-        let maxDist = (0..<numNodes).map { i in
-            simd.length(ptr[i].pos) // This is the standard Swift SIMD function
-        }.max() ?? 0
-        
-        // Calculate actual CoG to see if the GPU kernel is drifting
-        var sum = SIMD3<Float>(0,0,0)
-        for i in 0..<numNodes { sum += ptr[i].pos }
-        let actualCoG = sum / Float(numNodes)
-
-        print(String(format: "Step %d | CoG: (%.4f, %.4f, %.4f) | Max Dist: %.2f Å", t, actualCoG.x, actualCoG.y, actualCoG.z, maxDist))
-    }
 }
 
 print(sectionBreak)
