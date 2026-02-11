@@ -59,7 +59,7 @@ kernel void compute_displacement(
     uint base = gid * 3;
 
     // 2. Clamp the scalar to a reasonable range to prevent the Galaxy Exit
-    float scalar = clamp(coord_scalar[gid], -0.03f, 0.03f);
+    float scalar = clamp(coord_scalar[gid], -1.03f, 1.03f);
 
     int i = edge_index[gid].x;
     int j = edge_index[gid].y;

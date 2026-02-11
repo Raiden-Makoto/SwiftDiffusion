@@ -107,19 +107,19 @@ var numEdges = 8 // 4 bonds * 2
 let atomTypesCH4: [Int32] = [6, 1, 1, 1, 1]
 
 // DIFFUSION BUFFERS
-let alphasBuf = device.makeBuffer(length: 501 * 4, options: .storageModeShared)!
-let alphasCumprodBuf = device.makeBuffer(length: 501 * 4, options: .storageModeShared)!
+let alphasBuf = device.makeBuffer(length: 500 * 4, options: .storageModeShared)!
+let alphasCumprodBuf = device.makeBuffer(length: 500 * 4, options: .storageModeShared)!
 
 // --- Pre-compute the Schedule
 let timesteps = 500
 let betaStart: Float = 1e-4
 let betaEnd: Float = 0.02
 
-var alphas = [Float](repeating: 1.0, count: 501)
-var alphasCumprod = [Float](repeating: 1.0, count: 501)
+var alphas = [Float](repeating: 1.0, count: 500)
+var alphasCumprod = [Float](repeating: 1.0, count: 500)
 
 var currentCumprod: Float = 1.0
-for i in 1...timesteps {
+for i in 0..<timesteps {
     let beta = betaStart + (betaEnd - betaStart) * (Float(i-1) / Float(timesteps - 1))
     let alpha = 1.0 - beta
     currentCumprod *= alpha
@@ -128,12 +128,8 @@ for i in 1...timesteps {
     alphasCumprod[i] = currentCumprod
 }
 
-alphasBuf.contents().copyMemory(from: alphas, byteCount: 501 * 4)
-alphasCumprodBuf.contents().copyMemory(from: alphasCumprod, byteCount: 501 * 4)
-
-// check the schedule is correct
-let aPtr = alphasBuf.contents().bindMemory(to: Float.self, capacity: 501)
-let acPtr = alphasCumprodBuf.contents().bindMemory(to: Float.self, capacity: 501)
+alphasBuf.contents().copyMemory(from: alphas, byteCount: 500 * 4)
+alphasCumprodBuf.contents().copyMemory(from: alphasCumprod, byteCount: 500 * 4)
 
 // GRAPH BUFFERS
 let nodeBuf = device.makeBuffer(length: numNodes * MemoryLayout<Node>.stride, options: .storageModeShared)!
@@ -237,7 +233,7 @@ blitInit.endEncoding()
 copyCB.commit()
 copyCB.waitUntilCompleted()
 
-for t in (1...500).reversed() {
+for t in (0...499).reversed() {
     let currentT = Float(t)
     let resetCB = commandQueue.makeCommandBuffer()!
     let blit = resetCB.makeBlitCommandEncoder()!
