@@ -152,6 +152,7 @@ let msgAggBuf = device.makeBuffer(length: numNodes * hiddenDim * 4, options: .st
 let coordScalarBuf = device.makeBuffer(length: numEdges * 4, options: .storageModeShared)! // 1 float per edge
 let transBuf = device.makeBuffer(length: numEdges * 3 * 4, options: .storageModeShared)! // 3 floats per edge
 let posAggBuf = device.makeBuffer(length: numNodes * 3 * 4, options: .storageModeShared)! // 3 floats per node
+let posInputBuf = device.makeBuffer(length: numNodes * 3 * 4, options: .storageModePrivate)!
 let cogBuf = device.makeBuffer(length: 3 * 4, options: .storageModeShared)!
 
 // 3. Timestep specific buffers (CRITICAL for the loop)
@@ -190,7 +191,7 @@ let allKernels = [
     "embed_atoms", "inject_timestamp",
     "compute_message", "compute_displacement", "compute_node",
     "aggregate", "apply_diffusion",
-    "force_zero_center",
+    "force_zero_center", "layer_pos_update", "clear_buffer_float",
     "linear_128x128", "linear_128x1" // The new robust kernels
 ]
 
@@ -241,6 +242,11 @@ for t in (1...500).reversed() {
     let resetCB = commandQueue.makeCommandBuffer()!
     let blit = resetCB.makeBlitCommandEncoder()!
     blit.copy(from: baseHBuf, sourceOffset: 0, to: hBuf, destinationOffset: 0, size: hBuf.length)
+    for i in 0..<numNodes {
+        blit.copy(
+            from: nodeBuf, sourceOffset: i * MemoryLayout<Node>.stride,
+            to: posInputBuf, destinationOffset: i * 12, size: 12)
+    }
     blit.endEncoding()
     resetCB.commit()
     
@@ -341,7 +347,16 @@ for t in (1...500).reversed() {
         enc.setBytes(&nEdgesU, length: 4, index: 6)
         enc.dispatchThreads(MTLSize(width: numEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
         
-        // D. NODE MLP
+        // D. INTERMEDIATE POSITION UPDATE
+        // Mimics: pos = pos + displacement (inside the PyTorch layer)
+        enc.setComputePipelineState(pipeline["layer_pos_update"]!)
+        enc.setBuffer(nodeBuf, offset: 0, index: 0)
+        enc.setBuffer(posAggBuf, offset: 0, index: 1)
+        enc.setBytes(&nNodesU, length: 4, index: 2)
+        enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        enc.memoryBarrier(scope: .buffers)
+        
+        // E. NODE MLP
         enc.setComputePipelineState(pipeline["compute_node"]!)
         enc.setBuffer(hBuf, offset: 0, index: 0); enc.setBuffer(msgAggBuf, offset: 0, index: 1)
         enc.setBuffer(weights["layers.\(i).node_mlp.0.weight"]!, offset: 0, index: 2)
@@ -357,7 +372,6 @@ for t in (1...500).reversed() {
         enc.setBuffer(hUpdateBuf, offset: 0, index: 3) // Stage 2 -> Update
         enc.setBytes(&nNodesU, length: 4, index: 4); enc.setBytes(&skipSiLU, length: 4, index: 5)
         enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-        
     }
     
     // E. UPDATE ONCE OUTSIDE THE LOOP
@@ -365,14 +379,11 @@ for t in (1...500).reversed() {
     enc.setBuffer(nodeBuf, offset: 0, index: 0)
     enc.setBuffer(alphasBuf, offset: 0, index: 1)
     enc.setBuffer(alphasCumprodBuf, offset: 0, index: 2)
-    enc.setBuffer(posAggBuf, offset: 0, index: 3)
+    enc.setBuffer(posInputBuf, offset: 0, index: 3) // Original x_t
     var tUint = UInt32(t)
     enc.setBytes(&tUint, length: 4, index: 4)
     enc.setBytes(&nNodesU, length: 4, index: 5)
-    enc.dispatchThreads(
-        MTLSize(width: numNodes, height: 1, depth: 1),
-        threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
-    )
+    enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
 
     // --- CoG NORMALIZATION ---
     enc.setComputePipelineState(pipeline["force_zero_center"]!)
@@ -383,6 +394,28 @@ for t in (1...500).reversed() {
         MTLSize(width: 1, height: 1, depth: 1),
         threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1)
     )
+    
+    enc.memoryBarrier(scope: .buffers)
+    
+    // 7. ZERO AGGREGATORS FOR NEXT LAYER (Using same 'enc')
+    // This is the "Compute-style" memset.
+    enc.setComputePipelineState(pipeline["clear_buffer_float"]!)
+    
+    // Clear posAggBuf (3 floats per node)
+    enc.setBuffer(posAggBuf, offset: 0, index: 0)
+    var pCount = nNodesU * 3
+    enc.setBytes(&pCount, length: 4, index: 1)
+    enc.dispatchThreads(MTLSize(width: Int(pCount), height: 1, depth: 1),
+                        threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    
+    // Clear msgAggBuf (hDim floats per node)
+    enc.setBuffer(msgAggBuf, offset: 0, index: 0)
+    var mCount = nNodesU * hDim
+    enc.setBytes(&mCount, length: 4, index: 1)
+    enc.dispatchThreads(MTLSize(width: Int(mCount), height: 1, depth: 1),
+                        threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    
+    enc.memoryBarrier(scope: .buffers)
 
     enc.endEncoding()
     stepCB.commit()
