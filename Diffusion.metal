@@ -33,7 +33,7 @@ kernel void apply_diffusion(
     
     // 3. DDPM Reverse Step: x_{t-1} calculation
     float coeff = (1.0f - a_t) / (sqrt(1.0f - a_bar_t) + 1e-7f);
-    float damping = 0.80f;
+    float damping = 0.410f;
     
     // x_next = (1 / sqrt(a_t)) * (x_t - coeff * epsilon)
     // Note: We use x_t here, NOT pos_final.
