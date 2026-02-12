@@ -185,7 +185,7 @@ let timeElapsed = clock.measure {
         "embed_atoms", "inject_timestamp",
         "compute_message", "compute_displacement", "compute_node",
         "aggregate", "apply_diffusion",
-        "force_zero_center", "layer_pos_update", "clear_buffer_float",
+        "force_zero_center", "add_residual", "clear_buffer_float",
         "linear_128x128", "linear_128x1" // The new robust kernels
     ]
     
@@ -287,21 +287,23 @@ let timeElapsed = clock.measure {
         enc.setBuffer(hBuf, offset: 0, index: 0); enc.setBuffer(tProcessedBuf, offset: 0, index: 1)
         enc.setBytes(&hDim, length: 4, index: 2); enc.setBytes(&nNodesU, length: 4, index: 3)
         enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-        
+
         // --- EGNN LAYERS ---
+        
+        // 1. CLEAR POS AGGREGATOR ONCE PER TIMESTEP (Not per layer)
+        // This ensures Layer 0's push is added to Layer 1's push, etc.
+        enc.setComputePipelineState(pipeline["clear_buffer_float"]!)
+        enc.setBuffer(posAggBuf, offset: 0, index: 0)
+        var pCount = nNodesU * 3
+        enc.setBytes(&pCount, length: 4, index: 1)
+        enc.dispatchThreads(MTLSize(width: Int(pCount), height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        
+        enc.memoryBarrier(scope: .buffers)
+
         for i in 0..<numLayers {
-            // Z. ZERO AGGREGATORS FOR NEXT LAYER (Using same 'enc')
-            // must clear the buffers per layer not per timestep
+            // A. CLEAR MESSAGE AGGREGATOR (This IS per layer)
             enc.setComputePipelineState(pipeline["clear_buffer_float"]!)
-            
-            // Clear posAggBuf (3 floats per node)
-            enc.setBuffer(posAggBuf, offset: 0, index: 0)
-            var pCount = nNodesU * 3
-            enc.setBytes(&pCount, length: 4, index: 1)
-            enc.dispatchThreads(MTLSize(width: Int(pCount), height: 1, depth: 1),
-                                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-            
-            // Clear msgAggBuf (hDim floats per node)
             enc.setBuffer(msgAggBuf, offset: 0, index: 0)
             var mCount = nNodesU * hDim
             enc.setBytes(&mCount, length: 4, index: 1)
@@ -310,96 +312,103 @@ let timeElapsed = clock.measure {
             
             enc.memoryBarrier(scope: .buffers)
             
-            // A. MESSAGE MLP
+            // B. MESSAGE MLP (Standard)
             enc.setComputePipelineState(pipeline["compute_message"]!)
+            // ... (keep your existing buffer setting code) ...
             enc.setBuffer(hBuf, offset: 0, index: 0); enc.setBuffer(nodeBuf, offset: 0, index: 1); enc.setBuffer(edgeBuf, offset: 0, index: 2)
             enc.setBuffer(weights["layers.\(i).message_mlp.0.weight"]!, offset: 0, index: 3)
             enc.setBuffer(weights["layers.\(i).message_mlp.0.bias"]!, offset: 0, index: 4)
-            enc.setBuffer(tempH, offset: 0, index: 5) // Stage 1 -> Temp
+            enc.setBuffer(tempH, offset: 0, index: 5)
             enc.setBytes(&hDim, length: 4, index: 6)
             enc.dispatchThreads(MTLSize(width: numEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
             
+            // ... (keep linear_128x128 stage 2) ...
             enc.setComputePipelineState(pipeline["linear_128x128"]!)
-            enc.setBuffer(tempH, offset: 0, index: 0) // Temp -> Stage 2
+            enc.setBuffer(tempH, offset: 0, index: 0)
             enc.setBuffer(weights["layers.\(i).message_mlp.2.weight"]!, offset: 0, index: 1)
             enc.setBuffer(weights["layers.\(i).message_mlp.2.bias"]!, offset: 0, index: 2)
-            enc.setBuffer(msgBuf, offset: 0, index: 3) // Stage 2 -> MsgBuf
-            enc.setBytes(&nEdgesU, length: 4, index: 4);
-            enc.setBytes(&doSiLU, length: 4, index: 5)
+            enc.setBuffer(msgBuf, offset: 0, index: 3)
+            enc.setBytes(&nEdgesU, length: 4, index: 4); enc.setBytes(&doSiLU, length: 4, index: 5)
             enc.dispatchThreads(MTLSize(width: numEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-            
-            // B. COORDINATE MLP
-            enc.memoryBarrier(scope: .buffers) // Keep the barrier
+
+            enc.memoryBarrier(scope: .buffers)
+
+            // C. COORD MLP (Standard)
+            // ... (keep your existing coord mlp code) ...
             enc.setComputePipelineState(pipeline["linear_128x128"]!)
             enc.setBuffer(msgBuf, offset: 0, index: 0)
             enc.setBuffer(weights["layers.\(i).coord_mlp.0.weight"]!, offset: 0, index: 1)
             enc.setBuffer(weights["layers.\(i).coord_mlp.0.bias"]!, offset: 0, index: 2)
-            enc.setBuffer(coordTempBuf, offset: 0, index: 3) // USE NEW coordTempBuf HERE
-            enc.setBytes(&nEdgesU, length: 4, index: 4)
-            enc.setBytes(&doSiLU, length: 4, index: 5)
+            enc.setBuffer(coordTempBuf, offset: 0, index: 3)
+            enc.setBytes(&nEdgesU, length: 4, index: 4); enc.setBytes(&doSiLU, length: 4, index: 5)
             enc.dispatchThreads(MTLSize(width: numEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
             
             enc.setComputePipelineState(pipeline["linear_128x1"]!)
-            enc.setBuffer(coordTempBuf, offset: 0, index: 0) // READ FROM NEW coordTempBuf
+            enc.setBuffer(coordTempBuf, offset: 0, index: 0)
             enc.setBuffer(weights["layers.\(i).coord_mlp.2.weight"]!, offset: 0, index: 1)
             enc.setBuffer(weights["layers.\(i).coord_mlp.2.bias"]!, offset: 0, index: 2)
             enc.setBuffer(coordScalarBuf, offset: 0, index: 3)
-            enc.setBytes(&nEdgesU, length: 4, index: 4)
-            enc.setBytes(&skipSiLU, length: 4, index: 5)
+            enc.setBytes(&nEdgesU, length: 4, index: 4); enc.setBytes(&skipSiLU, length: 4, index: 5)
             enc.dispatchThreads(MTLSize(width: numEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
             
+            // D. DISPLACEMENT & AGGREGATE
             enc.setComputePipelineState(pipeline["compute_displacement"]!)
             enc.setBuffer(coordScalarBuf, offset: 0, index: 0); enc.setBuffer(nodeBuf, offset: 0, index: 1)
             enc.setBuffer(edgeBuf, offset: 0, index: 2); enc.setBuffer(transBuf, offset: 0, index: 3)
             enc.setBytes(&nEdgesU, length: 4, index: 4)
             enc.dispatchThreads(MTLSize(width: numEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
             
-            // C. AGGREGATE
             enc.setComputePipelineState(pipeline["aggregate"]!)
             enc.setBuffer(msgBuf, offset: 0, index: 0); enc.setBuffer(transBuf, offset: 0, index: 1)
             enc.setBuffer(edgeBuf, offset: 0, index: 2); enc.setBuffer(msgAggBuf, offset: 0, index: 3)
-            enc.setBuffer(posAggBuf, offset: 0, index: 4); enc.setBytes(&hDim, length: 4, index: 5)
-            enc.setBytes(&nEdgesU, length: 4, index: 6)
+            enc.setBuffer(posAggBuf, offset: 0, index: 4) // ACCUMULATES HERE
+            enc.setBytes(&hDim, length: 4, index: 5); enc.setBytes(&nEdgesU, length: 4, index: 6)
             enc.dispatchThreads(MTLSize(width: numEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
             
-            // D. INTERMEDIATE POSITION UPDATE
-            // Mimics: pos = pos + displacement (inside the PyTorch layer)
-            
-            enc.setComputePipelineState(pipeline["layer_pos_update"]!)
-            enc.setBuffer(nodeBuf, offset: 0, index: 0)
-            enc.setBuffer(posAggBuf, offset: 0, index: 1)
-            enc.setBytes(&nNodesU, length: 4, index: 2)
-            enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-            enc.memoryBarrier(scope: .buffers)
-            
-            // E. NODE MLP
+            // E. NODE MLP (Standard)
+            // ... (keep your existing node mlp code) ...
             enc.setComputePipelineState(pipeline["compute_node"]!)
             enc.setBuffer(hBuf, offset: 0, index: 0); enc.setBuffer(msgAggBuf, offset: 0, index: 1)
             enc.setBuffer(weights["layers.\(i).node_mlp.0.weight"]!, offset: 0, index: 2)
             enc.setBuffer(weights["layers.\(i).node_mlp.0.bias"]!, offset: 0, index: 3)
-            enc.setBuffer(tempH, offset: 0, index: 4) // Stage 1 -> Temp
+            enc.setBuffer(tempH, offset: 0, index: 4)
             enc.setBytes(&hDim, length: 4, index: 5)
             enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
             
             enc.setComputePipelineState(pipeline["linear_128x128"]!)
-            enc.setBuffer(tempH, offset: 0, index: 0) // Temp -> Stage 2
+            enc.setBuffer(tempH, offset: 0, index: 0)
             enc.setBuffer(weights["layers.\(i).node_mlp.2.weight"]!, offset: 0, index: 1)
             enc.setBuffer(weights["layers.\(i).node_mlp.2.bias"]!, offset: 0, index: 2)
-            enc.setBuffer(hUpdateBuf, offset: 0, index: 3) // Stage 2 -> Update
+            enc.setBuffer(hUpdateBuf, offset: 0, index: 3)
             enc.setBytes(&nNodesU, length: 4, index: 4); enc.setBytes(&skipSiLU, length: 4, index: 5)
             enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+
+            enc.memoryBarrier(scope: .buffers)
+
+            // F. UPDATE FEATURES (CRITICAL MISSING STEP)
+            // hBuf = hBuf + hUpdateBuf
+            enc.setComputePipelineState(pipeline["add_residual"]!)
+            enc.setBuffer(hBuf, offset: 0, index: 0)
+            enc.setBuffer(hUpdateBuf, offset: 0, index: 1)
+            var hCount = nNodesU * hDim
+            enc.setBytes(&hCount, length: 4, index: 2)
+            enc.dispatchThreads(MTLSize(width: Int(hCount), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
         }
+        
+        enc.memoryBarrier(scope: .buffers)
         
         // E. UPDATE ONCE OUTSIDE THE LOOP
         enc.setComputePipelineState(pipeline["apply_diffusion"]!)
         enc.setBuffer(nodeBuf, offset: 0, index: 0)
         enc.setBuffer(alphasBuf, offset: 0, index: 1)
         enc.setBuffer(alphasCumprodBuf, offset: 0, index: 2)
-        enc.setBuffer(posInputBuf, offset: 0, index: 3) // Original x_t
+        enc.setBuffer(posAggBuf, offset: 0, index: 3) // Original x_t
         var tUint = UInt32(t)
         enc.setBytes(&tUint, length: 4, index: 4)
         enc.setBytes(&nNodesU, length: 4, index: 5)
         enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        
+        enc.memoryBarrier(scope: .buffers)
         
         // --- CoG NORMALIZATION ---
         enc.setComputePipelineState(pipeline["force_zero_center"]!)

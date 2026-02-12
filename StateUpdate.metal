@@ -57,3 +57,14 @@ kernel void clear_buffer_float(
     if (gid >= count) return;
     buffer[gid] = 0.0f;
 }
+
+// Add this kernel to update node features (h = h + update)
+kernel void add_residual(
+    device float* accumulator    [[buffer(0)]],
+    device const float* update   [[buffer(1)]],
+    constant uint& count         [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= count) return;
+    accumulator[gid] += update[gid];
+}
