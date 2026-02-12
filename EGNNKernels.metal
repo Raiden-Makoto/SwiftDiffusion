@@ -42,24 +42,20 @@ kernel void compute_message(
     }
 }
 
-// EGNNKernels.metal
-
 kernel void compute_displacement(
-                                 device const float* coord_scalar [[buffer(0)]], // [E * 1]
-                                 device const Node* nodes          [[buffer(1)]],
-                                 device const int2* edge_index     [[buffer(2)]],
-                                 device float* trans_out           [[buffer(3)]], // FIXED: Use float* instead of float3*
-                                 constant uint& num_edges          [[buffer(4)]],
-                                 uint gid [[thread_position_in_grid]]
-                                 )
+    device const float* coord_scalar  [[buffer(0)]],
+    device const Node* nodes          [[buffer(1)]],
+    device const int2* edge_index     [[buffer(2)]],
+    device float* trans_out           [[buffer(3)]],
+    constant uint& num_edges          [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
 {
     if (gid >= num_edges) return;
 
-    // 1. Properly index the flat float buffer (12-byte stride)
     uint base = gid * 3;
 
-    float scalar = coord_scalar[gid];
-    scalar = clamp(scalar, -2.0f, 2.0f);
+    // Clamp the scalar to avoid "Lightspeed" jumps
+    float scalar = clamp(coord_scalar[gid], -2.0f, 2.0f);
 
     int i = edge_index[gid].x;
     int j = edge_index[gid].y;
@@ -67,15 +63,15 @@ kernel void compute_displacement(
     float3 pos_i = nodes[i].pos;
     float3 pos_j = nodes[j].pos;
     
-    // 3. Calculate relative displacement
     float3 diff = pos_i - pos_j;
-    float dist = length(diff) + 0.67f; // force separate them
     
-    // 4. Use unit direction so the force doesn't scale with the 17,000Å gap
+    // FIX: Calculate true distance for unit vector
+    float dist = length(diff) + 1e-8f;
     float3 unit_direction = diff / dist;
+    
+    // Apply displacement
     float3 translation = unit_direction * scalar;
 
-    // 5. Write out the final floats
     trans_out[base + 0] = translation.x;
     trans_out[base + 1] = translation.y;
     trans_out[base + 2] = translation.z;

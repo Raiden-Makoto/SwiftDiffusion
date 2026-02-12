@@ -14,7 +14,7 @@ kernel void apply_diffusion(
     device Node* nodes               [[buffer(0)]], // Current x_t positions
     device const float* alphas       [[buffer(1)]],
     device const float* alphas_cp    [[buffer(2)]],
-    device const float* pos_agg      [[buffer(3)]], // Total displacement from the 4 layers
+    device const float* pos_agg      [[buffer(3)]], // Total displacement from 4 layers
     constant uint& current_t         [[buffer(4)]],
     constant uint& num_nodes         [[buffer(5)]],
     uint gid [[thread_position_in_grid]])
@@ -27,18 +27,21 @@ kernel void apply_diffusion(
     
     // 2. Load current position (x_t) and predicted noise (epsilon)
     float3 x_t = nodes[gid].pos;
+    
+    // Read the aggregated noise from all 4 layers
     uint base = gid * 3;
     float3 epsilon = float3(pos_agg[base], pos_agg[base + 1], pos_agg[base + 2]);
     
     // 3. DDPM Reverse Step: x_{t-1} calculation
-    // coeff = (1 - alpha_t) / sqrt(1 - alpha_cumprod_t)
     float coeff = (1.0f - a_t) / (sqrt(1.0f - a_bar_t) + 1e-7f);
-    
-    // Use 1.0 damping. Higher damping was only needed because of the double-move bug.
     float damping = 1.0f;
     
-    // Apply the standard diffusion formula
-    float3 x_next = (1.0f / sqrt(a_t + 1e-7f)) * (x_t - (damping * coeff * epsilon));
+    // CRITICAL FIX 1: REMOVED (1.0/sqrt(a_t)).
+    // This stops the 1.01x expansion per step.
+    
+    // CRITICAL FIX 2: CHANGED '+' to '-'.
+    // We subtract the noise to move towards data.
+    float3 x_next = x_t - (damping * coeff * epsilon);
 
     // 4. Update for next timestep
     nodes[gid].pos = x_next;

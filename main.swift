@@ -358,12 +358,19 @@ let timeElapsed = clock.measure {
             enc.setBytes(&nEdgesU, length: 4, index: 4)
             enc.dispatchThreads(MTLSize(width: numEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
             
+            // C. AGGREGATE (Updated for Serial Safety)
             enc.setComputePipelineState(pipeline["aggregate"]!)
-            enc.setBuffer(msgBuf, offset: 0, index: 0); enc.setBuffer(transBuf, offset: 0, index: 1)
-            enc.setBuffer(edgeBuf, offset: 0, index: 2); enc.setBuffer(msgAggBuf, offset: 0, index: 3)
-            enc.setBuffer(posAggBuf, offset: 0, index: 4) // ACCUMULATES HERE
-            enc.setBytes(&hDim, length: 4, index: 5); enc.setBytes(&nEdgesU, length: 4, index: 6)
-            enc.dispatchThreads(MTLSize(width: numEdges, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            enc.setBuffer(msgBuf, offset: 0, index: 0)
+            enc.setBuffer(transBuf, offset: 0, index: 1)
+            enc.setBuffer(edgeBuf, offset: 0, index: 2)
+            enc.setBuffer(msgAggBuf, offset: 0, index: 3)
+            enc.setBuffer(posAggBuf, offset: 0, index: 4)
+            enc.setBytes(&hDim, length: 4, index: 5)
+            enc.setBytes(&nEdgesU, length: 4, index: 6)
+            
+            // CRITICAL CHANGE: Dispatch numNodes, not numEdges
+            enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
             
             // E. NODE MLP (Standard)
             // ... (keep your existing node mlp code) ...
