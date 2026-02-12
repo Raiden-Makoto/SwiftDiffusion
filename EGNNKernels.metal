@@ -59,7 +59,7 @@ kernel void compute_displacement(
     uint base = gid * 3;
 
     float scalar = coord_scalar[gid];
-    scalar = clamp(scalar, -10.0f, 10.0f);
+    scalar = clamp(scalar, -2.0f, 2.0f);
 
     int i = edge_index[gid].x;
     int j = edge_index[gid].y;
