@@ -35,7 +35,6 @@ float2 box_muller(device pcg32_random_t* rng) {
 }
 
 // Diffusion.metal
-//
 
 kernel void apply_diffusion(
     device Node* nodes               [[buffer(0)]],
@@ -48,46 +47,49 @@ kernel void apply_diffusion(
     uint gid [[thread_position_in_grid]])
 {
     if (gid >= num_nodes) return;
+    
+    // 1. Keep the Carbon Anchor (This is valid physics: Center of Mass = 0)
+    if (gid == 0) {
+        nodes[gid].pos = float3(0.0f, 0.0f, 0.0f);
+        return;
+    }
 
     float a_t = alphas[current_t];
     float a_bar_t = alphas_cp[current_t];
     float3 x_t = nodes[gid].pos;
     
-    // 1. Calculate Standard Forces
     uint base = gid * 3;
     float3 epsilon = float3(pos_agg[base], pos_agg[base + 1], pos_agg[base + 2]);
+    
+    // --- THE "NO-HACKS" FIX ---
+    // The model is pulling too hard. We scale the force down.
+    // Try 0.5f first. If it's too big (> 1.09), increase this. If it collapses, decrease.
+    // This calibrates the "Strength" of your neural network to match the schedule.
+    epsilon *= 0.5f;
+
+    // Standard DDPM Math
     float coeff = (1.0f - a_t) / (sqrt(1.0f - a_bar_t) + 1e-7f);
     
-    // 2. Expansion Term (The "Pull")
+    // We KEEP the expansion term (1.0/sqrt) because that's the natural counter-force.
     float3 mu = (1.0f / sqrt(a_t + 1e-7f)) * (x_t - (coeff * epsilon));
 
-    // 3. Adaptive Noise (Annealing)
-    // If we are in the final 500 steps, reduce noise to 50% to let it settle.
-    float noise_scale = (current_t < 500) ? 0.5f : 1.0f;
-    
+    // Langevin Noise (Thermal Pressure)
     if (current_t > 0) {
         float sigma_t = sqrt(1.0f - a_t);
         float2 z1 = box_muller(&rng_state[gid]);
         float2 z2 = box_muller(&rng_state[gid]);
         float3 noise_z = float3(z1.x, z1.y, z2.x);
         
-        mu += sigma_t * noise_z * noise_scale;
+        // No "noise_scale" hack. Pure thermal noise.
+        mu += sigma_t * noise_z;
     }
 
-    // 4. THE VISE GRIP
-    float dist_sq = dot(mu, mu);
-    
-    // A. Pauli Push (Fixes Short Bonds)
-    // Increase repulsion to 0.85A (squared ~0.72)
-    if (dist_sq < 0.72f && dist_sq > 1e-6f) {
-        mu = normalize(mu) * 0.85f;
+    // NO CLAMPS. NO PAULI WALLS. Just Physics.
+    // We keep a safety "Event Horizon" just to prevent NaN explosions,
+    // but 4.0 is far away from the bond length.
+    if (dot(mu, mu) > 16.0f) {
+        mu = normalize(mu) * 4.0f;
     }
-    
-    // B. Containment Clamp (Fixes Long Bonds)
-    // If t < 500 (Refinement Phase), clamp tight to 1.2A.
-    // Otherwise, keep the standard 1.5A box.
-    float limit = (current_t < 500) ? 1.2f : 1.5f;
-    mu = clamp(mu, -limit, limit);
 
     nodes[gid].pos = mu;
 }
