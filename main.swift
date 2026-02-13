@@ -48,12 +48,12 @@ let timeElapsed = clock.measure {
             if data.count == expectedBytes {
                 buffer.contents().copyMemory(from: (data as NSData).bytes, byteCount: data.count)
                 weights[name] = buffer
-                print("VERIFIED: \(name).bin (\(data.count) bytes)")
+                //print("VERIFIED: \(name).bin (\(data.count) bytes)")
             } else if data.count < expectedBytes {
-                print("PARTIAL LOAD: \(name).bin \(data.count)/\(expectedBytes) loaded. Padding with zeros")
+                //print("PARTIAL LOAD: \(name).bin \(data.count)/\(expectedBytes) loaded. Padding with zeros")
                 weights[name] = buffer
             } else {
-                print("SIZE MISMATCH: \(name) - File: \(data.count), Buffer Needs: \(expectedBytes)")
+               // print("SIZE MISMATCH: \(name) - File: \(data.count), Buffer Needs: \(expectedBytes)")
             }
         } catch {
             print("NOT FOUND: \(name).bin at \(fileURL.path)")
@@ -107,6 +107,16 @@ let timeElapsed = clock.measure {
     // DIFFUSION BUFFERS
     let alphasBuf = device.makeBuffer(length: 2500 * 4, options: .storageModeShared)!
     let alphasCumprodBuf = device.makeBuffer(length: 2500 * 4, options: .storageModeShared)!
+    
+    // Random Noise buffers
+    let rngSize = numNodes * MemoryLayout<UInt64>.size * 2 // state + inc
+    let rngBuf = device.makeBuffer(length: rngSize, options: .storageModeShared)!
+    let rngPtr = rngBuf.contents().bindMemory(to: UInt64.self, capacity: numNodes * 2)
+
+    for i in 0..<numNodes {
+        rngPtr[i * 2] = UInt64.random(in: 0...UInt64.max)     // seed state
+        rngPtr[i * 2 + 1] = UInt64(i * 2 + 1) | 1            // unique stream ID
+    }
     
     // --- Pre-compute the Schedule
     let timesteps = 2500
@@ -289,18 +299,6 @@ let timeElapsed = clock.measure {
         enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
 
         // --- EGNN LAYERS ---
-        
-        // 1. CLEAR POS AGGREGATOR ONCE PER TIMESTEP (Not per layer)
-        // This ensures Layer 0's push is added to Layer 1's push, etc.
-        enc.setComputePipelineState(pipeline["clear_buffer_float"]!)
-        enc.setBuffer(posAggBuf, offset: 0, index: 0)
-        var pCount = nNodesU * 3
-        enc.setBytes(&pCount, length: 4, index: 1)
-        enc.dispatchThreads(MTLSize(width: Int(pCount), height: 1, depth: 1),
-                            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-        
-        enc.memoryBarrier(scope: .buffers)
-
         for i in 0..<numLayers {
             // A. CLEAR MESSAGE AGGREGATOR (This IS per layer)
             enc.setComputePipelineState(pipeline["clear_buffer_float"]!)
@@ -413,6 +411,7 @@ let timeElapsed = clock.measure {
         var tUint = UInt32(t)
         enc.setBytes(&tUint, length: 4, index: 4)
         enc.setBytes(&nNodesU, length: 4, index: 5)
+        enc.setBuffer(rngBuf, offset: 0, index: 6)
         enc.dispatchThreads(MTLSize(width: numNodes, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
         
         enc.memoryBarrier(scope: .buffers)

@@ -26,7 +26,7 @@ kernel void compute_message(
     
     // Calculate Radial Invariant: squared distance + epsilon
     float3 diff = nodes[i].pos - nodes[j].pos;
-    float radial = min(dot(diff, diff), 267.0f) + 1e-8f;
+    float radial = min(dot(diff, diff), 16.7f) + 1e-8f;
 
     for (uint row = 0; row < hidden_dim; row++) {
         float acc = bias[row];
@@ -55,7 +55,7 @@ kernel void compute_displacement(
     uint base = gid * 3;
 
     // Clamp the scalar to avoid "Lightspeed" jumps
-    float scalar = clamp(coord_scalar[gid], -2.0f, 2.0f);
+    float scalar = coord_scalar[gid]; //clamp(coord_scalar[gid], -10.0f, 10.0f);
 
     int i = edge_index[gid].x;
     int j = edge_index[gid].y;
@@ -66,7 +66,7 @@ kernel void compute_displacement(
     float3 diff = pos_i - pos_j;
     
     // FIX: Calculate true distance for unit vector
-    float dist = length(diff) + 1e-8f;
+    float dist = length(diff) + 1e-5f;
     float3 unit_direction = diff / dist;
     
     // Apply displacement
