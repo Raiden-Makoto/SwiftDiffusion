@@ -170,7 +170,7 @@ let timeElapsed = clock.measure {
     // --- INITIALIZATION ---
     // Initialize Nodes with Noise
     var noiseNodes = [Node](repeating: Node(pos: .init(0,0,0), atomType: 0), count: numNodes)
-    let initialSigma = Float(1.67)
+    let initialSigma = Float(1.067)
     for i in 0..<numNodes {
         let randomPos = SIMD3<Float>(
             Float.random(in: -1...1) * initialSigma,
