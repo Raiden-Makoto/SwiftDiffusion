@@ -1,4 +1,4 @@
-# SwiftDiffusion
+![logo](SwiftDiffusion.png)
 *Equivariant Graph Diffusion Network Inference optimized for Apple Silicon*
                                                                 
 SwiftDiffusion is a low-level from-scratch implementation of an Equivariant Graph Neural Network (EGNN) paired with a Denoising Diffusion Probabilistic Model (DDPM), written entirely in Swift and Metal Shading Language.
